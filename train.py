@@ -7,7 +7,7 @@ from pathlib import Path
 
 from torchvision import transforms
 
-from model import build_vit
+from model import build_hybrid_vit
 from dataset import LungCancerDataset
 from config import get_config, get_weights_file_path
 
@@ -82,7 +82,7 @@ def get_ds(config):
 
 
 def get_model(config):
-    model = build_vit(config['image_size'], config['in_channels'], config['patch_size'], config['heads'], config['mlp_dim'], config['embedding_dim'], config['class_size'], config['layers'])
+    model = build_hybrid_vit(config)
     return model
 
 
@@ -96,7 +96,9 @@ def train_model(config):
     #Tensorboard
     writer = SummaryWriter(config['experiment_name'])
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], eps=1e-9)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], eps=1e-9, weight_decay=0.05)
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['num_epochs'])
 
     initial_epoch = 0
     global_step = 0
@@ -108,7 +110,7 @@ def train_model(config):
         optimizer.load_state_dict(state['optimizer_state_dict'])
         global_step = state['global_step']
 
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.NLLLoss()
 
     for epoch in range(initial_epoch, config['num_epochs']):
         model.train()
@@ -118,6 +120,8 @@ def train_model(config):
         for images, labels in batch_iterator:
             images = images.to(device)
             labels = labels.to(device)
+
+            optimizer.zero_grad()
 
             outputs = model.encode(images)
             projs = model.project(outputs)
@@ -134,10 +138,10 @@ def train_model(config):
 
             # Update the weights
             optimizer.step()
-            optimizer.zero_grad()
 
             global_step += 1
-        
+            
+        scheduler.step()
         run_validation(model, val_dataloader, device)
         
         model_filename = get_weights_file_path(config, f"{epoch:02d}")

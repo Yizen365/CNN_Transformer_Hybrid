@@ -4,6 +4,69 @@ import torch.nn as nn
 import math
 
 
+class Stem(nn.Module):
+    def __init__(self, in_channels: int=3, out_channels: int=64):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU()
+        )
+    
+    def forward(self, x):
+        return self.stem(x)
+    
+
+class Conv(nn.Module):
+    def __init__(self, in_channels: int, expansion: int=4, stride: int=1):
+        super().__init__()
+        hidden_dim = in_channels * expansion
+        self.expand = nn.Conv2d(in_channels, out_channels=hidden_dim, kernel_size=1)
+        self.bn1 = nn.BatchNorm2d(hidden_dim)
+        self.d_conv = nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=3, stride=stride, padding=1, groups=hidden_dim)
+        self.bn2 = nn.BatchNorm2d(hidden_dim)
+        self.proj = nn.Conv2d(in_channels=hidden_dim, out_channels=in_channels, kernel_size=1)
+        self.bn3 = nn.BatchNorm2d(in_channels)
+        self.act = nn.GELU()
+        self.use_residual = stride == 1
+
+    def forward(self, x):
+        residual = x
+        x = self.act(self.bn1(self.expand(x)))
+        x = self.act(self.bn2(self.d_conv(x)))
+        x = self.bn3(self.proj(x))
+        if self.use_residual:
+            return x + residual
+        return x
+    
+
+class ConvStage(nn.Module):
+    def __init__(self, in_channels: int, num_blocks: int=3):
+        super().__init__()
+        layers = []
+        layers.append(Conv(in_channels, stride=2))
+        for _ in range(num_blocks - 1):
+            layers.append(Conv(in_channels))
+        self.blocks = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.blocks(x)
+    
+
+class HybridConv(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.stem = Stem(3, 64)
+        self.stage1 = ConvStage(64, num_blocks=2)
+        self.stage2 = ConvStage(64, num_blocks=2)
+
+    def forward(self, x):
+        return self.stage2(self.stage1(self.stem(x))) # (B, 64, 28, 28)
+
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, seq_len: int, dropout: float) -> None:
         super().__init__()
@@ -27,7 +90,7 @@ class PositionalEncoding(nn.Module):
 
 
 class PatchEmbedding(nn.Module):
-    def __init__(self, image_size: int, in_channels: int, d_model: int, patch_size: int, positional_encoding: PositionalEncoding, dropout: float) -> None:
+    def __init__(self, image_size: int, in_channels: int, d_model: int, patch_size: int, dropout: float) -> None:
         super().__init__()
         self.proj = nn.Conv2d(in_channels=in_channels, out_channels=d_model, kernel_size=patch_size, stride=patch_size)
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
@@ -161,42 +224,49 @@ class ProjectionLayer(nn.Module):
         return torch.log_softmax(self.proj(x[:, 0]), dim=-1)
     
 
-class ViT(nn.Module):
-    def __init__(self, patch_embedding: PatchEmbedding, encoder: Encoder, projection_layer: ProjectionLayer):
+class Hybrid_ViT(nn.Module):
+    def __init__(self, conv_layer: HybridConv, patch_embedding: PatchEmbedding, encoder: Encoder, projection_layer: ProjectionLayer):
         super().__init__()
+        self.cnn = conv_layer
         self.patch_embedding = patch_embedding
-        self.encoder = encoder
+        self.transformer = encoder
         self.projection_layer = projection_layer
 
     def encode(self, x):
+        x = self.cnn(x)
         x = self.patch_embedding(x)
-        x = self.encoder(x)
+        x = self.transformer(x)
         return x
 
     def project(self, x):
         return self.projection_layer(x)
     
 
-def build_vit(image_size: int, in_channels: int, patch_size: int, h: int=8, d_ff: int=2048, d_model: int=512, class_size: int=3, Nx: int=6, dropout: float=0.1):
-    num_patches = (image_size // patch_size) ** 2
-    positional_encoding = PositionalEncoding(d_model, num_patches, dropout)
-    patch_embedding = PatchEmbedding(image_size, in_channels, d_model, patch_size, positional_encoding, dropout)
+def build_hybrid_vit(config, dropout: float=0.1):
+
+    conv_layer = HybridConv()
+
+    num_patches = (config['image_size'] // config['patch_size']) ** 2
+    positional_encoding = PositionalEncoding(config['d_model'], num_patches, dropout)
+    patch_embedding = PatchEmbedding(config['image_size'], config['trans_in_channels'], config['d_model'], config['patch_size'], dropout)
 
     encoder_blocks = []
-    for _ in range(Nx):
-        self_attention = MultiHeadAttentionBlock(d_model, dropout, h)
-        feed_forward = FeedForwardBlock(d_model, d_ff, dropout)
+    for _ in range(config['layers']):
+        self_attention = MultiHeadAttentionBlock(config['d_model'], dropout, config['heads'])
+        feed_forward = FeedForwardBlock(config['d_model'], config['mlp_dim'], dropout)
         encoder_block = EncoderBlock(self_attention, feed_forward, dropout)
         encoder_blocks.append(encoder_block)
 
     encoder = Encoder(nn.ModuleList(encoder_blocks))
 
-    projection_layer = ProjectionLayer(d_model, class_size)
+    projection_layer = ProjectionLayer(config['d_model'], config['class_size'])
 
-    vit = ViT(patch_embedding, encoder, projection_layer)
+    vit = Hybrid_ViT(conv_layer, patch_embedding, encoder, projection_layer)
 
-    for p in vit.parameters():
-        if p.dim() > 1:
-            nn.init.xavier_normal_(p)
+    for m in vit.modules():
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight)
+        elif isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight)
 
     return vit

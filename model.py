@@ -1,70 +1,22 @@
 import torch
 import torch.nn as nn
+from torchvision import models
 
 import math
 
 
-class Stem(nn.Module):
-    def __init__(self, in_channels: int=3, out_channels: int=64):
+class CNN_Backbone(nn.Module):
+    def __init__(self, d_model: int=512):
         super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.GELU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.GELU()
-        )
+        resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+        self.cnn = nn.Sequential(*list(resnet.children())[:-2]) # remove classifier and avg pool
+        self.proj = nn.Linear(2048, d_model)
     
-    def forward(self, x):
-        return self.stem(x)
-    
-
-class Conv(nn.Module):
-    def __init__(self, in_channels: int, expansion: int=4, stride: int=1):
-        super().__init__()
-        hidden_dim = in_channels * expansion
-        self.expand = nn.Conv2d(in_channels, out_channels=hidden_dim, kernel_size=1)
-        self.bn1 = nn.BatchNorm2d(hidden_dim)
-        self.d_conv = nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=3, stride=stride, padding=1, groups=hidden_dim)
-        self.bn2 = nn.BatchNorm2d(hidden_dim)
-        self.proj = nn.Conv2d(in_channels=hidden_dim, out_channels=in_channels, kernel_size=1)
-        self.bn3 = nn.BatchNorm2d(in_channels)
-        self.act = nn.GELU()
-        self.use_residual = stride == 1
-
-    def forward(self, x):
-        residual = x
-        x = self.act(self.bn1(self.expand(x)))
-        x = self.act(self.bn2(self.d_conv(x)))
-        x = self.bn3(self.proj(x))
-        if self.use_residual:
-            return x + residual
+    def forward(self, x: torch.Tensor):
+        x = self.cnn(x) # output is (B, 2048, 7, 7)
+        x = x.flatten(2).transpose(1, 2) # (B, 1280, 7, 7) -> (B, 1280, 49) -> (B, 49, 1280)
+        x = self.proj(x) # (B, 49, 1280) -> (B, 49, 512)
         return x
-    
-
-class ConvStage(nn.Module):
-    def __init__(self, in_channels: int, num_blocks: int=3):
-        super().__init__()
-        layers = []
-        layers.append(Conv(in_channels, stride=2))
-        for _ in range(num_blocks - 1):
-            layers.append(Conv(in_channels))
-        self.blocks = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.blocks(x)
-    
-
-class HybridConv(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.stem = Stem(3, 64)
-        self.stage1 = ConvStage(64, num_blocks=2)
-        self.stage2 = ConvStage(64, num_blocks=2)
-
-    def forward(self, x):
-        return self.stage2(self.stage1(self.stem(x))) # (B, 64, 28, 28)
 
 
 class PositionalEncoding(nn.Module):
@@ -221,34 +173,74 @@ class ProjectionLayer(nn.Module):
         self.proj = nn.Linear(d_model, class_size)
 
     def forward(self, x):
-        return torch.log_softmax(self.proj(x[:, 0]), dim=-1)
+        return torch.log_softmax(self.proj(x), dim=-1)
     
 
-class Hybrid_ViT(nn.Module):
-    def __init__(self, conv_layer: HybridConv, patch_embedding: PatchEmbedding, encoder: Encoder, projection_layer: ProjectionLayer):
+class CrossAttentionFusion(nn.Module):
+    def __init__(self, d_model: int, dropout: float, h: int):
         super().__init__()
-        self.cnn = conv_layer
+        self.cross_attention = MultiHeadAttentionBlock(d_model, dropout, h)
+        self.w_o = nn.Linear(out_features=d_model, in_features=2*d_model)
+        self.norm = LayerNormalizationBlock()
+
+    def forward(self, query, key, value):
+        attention = self.cross_attention(query, key, value)
+        fused_attention = torch.cat([query, attention], dim=-1)
+        fused_attention = self.w_o(fused_attention)
+        fused_attention = self.norm(fused_attention + query)
+        return fused_attention
+
+    
+
+class Hybrid_CNN_ViT(nn.Module):
+    def __init__(self, conv_layer: CNN_Backbone, patch_embedding: PatchEmbedding, encoder: Encoder, cross_attention_fuse: CrossAttentionFusion, projection_layer: ProjectionLayer):
+        super().__init__()
+        self.cnn_backbone = conv_layer
         self.patch_embedding = patch_embedding
-        self.transformer = encoder
+        self.encoder = encoder
+        self.cross_attention_fuse = cross_attention_fuse
         self.projection_layer = projection_layer
 
-    def encode(self, x):
-        x = self.cnn(x)
-        x = self.patch_embedding(x)
-        x = self.transformer(x)
+    def convolution(self, x):
+        x = self.cnn_backbone(x)
         return x
+
+    def encode(self, x):
+        x = self.patch_embedding(x)
+        x = self.encoder(x)
+        return x
+    
+    def cross_attention_fusion(self, query, key, value):
+        return self.cross_attention_fuse(query, key, value)
 
     def project(self, x):
         return self.projection_layer(x)
     
+    def forward(self, x):
+        x1 = self.convolution(x)
+        x2 = self.encode(x)
+        cross_attention_fused = self.cross_attention_fusion(x2, x1, x1)
+        cls_token = cross_attention_fused[:, 0]
+        return self.project(cls_token)
+    
 
-def build_hybrid_vit(config, dropout: float=0.1):
+def init_vit_weights(model):
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
 
-    conv_layer = HybridConv()
 
-    num_patches = (config['image_size'] // config['patch_size']) ** 2
-    positional_encoding = PositionalEncoding(config['d_model'], num_patches, dropout)
-    patch_embedding = PatchEmbedding(config['image_size'], config['trans_in_channels'], config['d_model'], config['patch_size'], dropout)
+def build_hybrid(config, dropout: float=0.1):
+
+    conv_layer = CNN_Backbone()
+
+    patch_embedding = PatchEmbedding(config['image_size'], config['in_channels'], config['d_model'], config['patch_size'], dropout)
 
     encoder_blocks = []
     for _ in range(config['layers']):
@@ -259,14 +251,14 @@ def build_hybrid_vit(config, dropout: float=0.1):
 
     encoder = Encoder(nn.ModuleList(encoder_blocks))
 
+    cross_attention_fuse = CrossAttentionFusion(config['d_model'], dropout, config['heads'])
+
     projection_layer = ProjectionLayer(config['d_model'], config['class_size'])
 
-    vit = Hybrid_ViT(conv_layer, patch_embedding, encoder, projection_layer)
+    hybrid = Hybrid_CNN_ViT(conv_layer, patch_embedding, encoder, cross_attention_fuse, projection_layer)
 
-    for m in vit.modules():
-        if isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight)
-        elif isinstance(m, nn.Linear):
-            nn.init.xavier_normal_(m.weight)
+    init_vit_weights(hybrid.patch_embedding)
+    init_vit_weights(hybrid.encoder)
+    init_vit_weights(hybrid.projection_layer)
 
-    return vit
+    return hybrid

@@ -5,6 +5,9 @@ __pycache__/
 
 data/
 testing/
+lung_image_sets/
+LIDC-IDRI-slices/
+weightsOG/
 
 *.pt
 *.pth

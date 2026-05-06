@@ -1,19 +1,106 @@
 import torch
 import torch.nn as nn
-from torchvision import models
 
 import math
+
+
+class InvertedResidual(nn.Module):
+    def __init__(self, in_channels, out_channels, stride, expand_ratio):
+        super().__init__()
+        hidden_dim = int(in_channels * expand_ratio)
+        self.use_residual = (stride == 1 and in_channels == out_channels)
+
+        layers = []
+
+        # Expansion (1x1 conv)
+        if expand_ratio != 1:
+            layers.extend([
+                nn.Conv2d(in_channels, hidden_dim, 1, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU6(inplace=True),
+            ])
+
+        # Depthwise
+        layers.extend([
+            nn.Conv2d(hidden_dim, hidden_dim, 3,
+                      stride=stride,
+                      padding=1,
+                      groups=hidden_dim,
+                      bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU6(inplace=True),
+        ])
+
+        # Projection (Linear bottleneck)
+        layers.extend([
+            nn.Conv2d(hidden_dim, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+        ])
+
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        if self.use_residual:
+            return x + self.conv(x)
+        return self.conv(x)
+
+
+class MobileNetV2(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # (expand_ratio, channels, repeats, stride)
+        cfg = [
+            (1, 16, 1, 1),
+            (6, 24, 2, 2),
+            (6, 32, 3, 2),
+            (6, 64, 4, 2),
+            (6, 96, 3, 1),
+            (6, 160, 3, 2),
+            (6, 320, 1, 1),
+        ]
+
+        layers = []
+
+        # Initial conv
+        input_channel = 32
+        layers.extend([
+            nn.Conv2d(3, input_channel, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(input_channel),
+            nn.ReLU6(inplace=True),
+        ])
+
+        # Inverted residual blocks
+        for t, c, n, s in cfg:
+            for i in range(n):
+                stride = s if i == 0 else 1
+                layers.append(
+                    InvertedResidual(input_channel, c, stride, expand_ratio=t)
+                )
+                input_channel = c
+
+        # Final layer
+        layers.extend([
+            nn.Conv2d(input_channel, 1280, 1, bias=False),
+            nn.BatchNorm2d(1280),
+            nn.ReLU6(inplace=True),
+        ])
+
+        self.features = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.features(x)
+        return x
 
 
 class CNN_Backbone(nn.Module):
     def __init__(self, d_model: int=512):
         super().__init__()
-        resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
-        self.cnn = nn.Sequential(*list(resnet.children())[:-2]) # remove classifier and avg pool
-        self.proj = nn.Linear(2048, d_model)
+        self.cnn = MobileNetV2()
+        self.proj = nn.Linear(1280, d_model)
     
     def forward(self, x: torch.Tensor):
-        x = self.cnn(x) # output is (B, 2048, 7, 7)
+        x = self.cnn(x) # output is (B, 1280, 7, 7)
         x = x.flatten(2).transpose(1, 2) # (B, 1280, 7, 7) -> (B, 1280, 49) -> (B, 49, 1280)
         x = self.proj(x) # (B, 49, 1280) -> (B, 49, 512)
         return x
@@ -62,16 +149,15 @@ class PatchEmbedding(nn.Module):
     
 
 class LayerNormalizationBlock(nn.Module):
-    def __init__(self, eps: float=10**-9) -> None:
+    def __init__(self, d_model: int=512, eps: float=1e-9) -> None:
         super().__init__()
         self.eps = eps
-        self.alpha = nn.Parameter(torch.ones(1))
-        self.bias = nn.Parameter(torch.zeros(1))
-
+        self.alpha = nn.Parameter(torch.ones(d_model))
+        self.bias = nn.Parameter(torch.zeros(d_model))
     def forward(self, x):
         mean = x.mean(dim=-1, keepdim=True)
-        std = x.std(dim=-1, keepdim=True)
-        return self.alpha * (x - mean) / (std + self.eps) + self.bias
+        var = x.var(dim=-1, unbiased=False, keepdim=True)
+        return self.alpha * (x - mean) / torch.sqrt(var + self.eps) + self.bias
 
 
 class FeedForwardBlock(nn.Module):
@@ -114,8 +200,8 @@ class MultiHeadAttentionBlock(nn.Module):
     def forward(self, q, k, v):
         # (B, seq_len, d_model) -> (B, seq_len, d_model)
         query = self.w_q(q)
-        key = self.w_q(k)
-        value = self.w_q(v)
+        key = self.w_k(k)
+        value = self.w_v(v)
 
         # (B, seq_len, d_model) -> (B, seq_len, h, d_k) -> (B, h, seq_len, d_k)
         query = query.view(query.shape[0], query.shape[1], self.h, self.d_k).transpose(1, 2)
@@ -135,7 +221,7 @@ class ResidualConnection(nn.Module):
     def __init__(self, dropout: float):
         super().__init__()
         self.dropout = nn.Dropout(dropout)
-        self.norm = LayerNormalizationBlock()
+        self.norm = LayerNormalizationBlock(d_model=512)
 
     def forward(self, x, sublayer):
         return x + self.dropout(sublayer(self.norm(x)))
@@ -147,19 +233,18 @@ class EncoderBlock(nn.Module):
         self.self_attention = self_attention
         self.feed_forward = feed_forward
         self.residual_connections = nn.ModuleList([ResidualConnection(dropout) for _ in range(2)])
-        self.norm = LayerNormalizationBlock()
-
+        
     def forward(self, x):
         x = self.residual_connections[0](x, lambda x: self.self_attention(x, x, x))
         x = self.residual_connections[1](x, self.feed_forward)
-        return self.norm(x)
+        return x
     
 
 class Encoder(nn.Module):
     def __init__(self, layers: nn.ModuleList):
         super().__init__()
         self.layers = layers
-        self.norm = LayerNormalizationBlock()
+        self.norm = LayerNormalizationBlock(d_model=512)
 
     def forward(self, x):
         for layer in self.layers:
@@ -173,7 +258,7 @@ class ProjectionLayer(nn.Module):
         self.proj = nn.Linear(d_model, class_size)
 
     def forward(self, x):
-        return torch.log_softmax(self.proj(x), dim=-1)
+        return self.proj(x)
     
 
 class CrossAttentionFusion(nn.Module):
@@ -181,13 +266,17 @@ class CrossAttentionFusion(nn.Module):
         super().__init__()
         self.cross_attention = MultiHeadAttentionBlock(d_model, dropout, h)
         self.w_o = nn.Linear(out_features=d_model, in_features=2*d_model)
-        self.norm = LayerNormalizationBlock()
+        self.norm = LayerNormalizationBlock(d_model=d_model)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, query, key, value):
-        attention = self.cross_attention(query, key, value)
-        fused_attention = torch.cat([query, attention], dim=-1)
-        fused_attention = self.w_o(fused_attention)
-        fused_attention = self.norm(fused_attention + query)
+        normed_query = self.norm(query)
+        normed_key = self.norm(key)
+        normed_value = self.norm(value)
+        attention = self.cross_attention(normed_query, normed_key, normed_value)
+        fused_attention = torch.cat([normed_query, attention], dim=-1)
+        fused_attention = self.dropout(self.w_o(fused_attention))
+        fused_attention = fused_attention + query
         return fused_attention
 
     
@@ -236,7 +325,7 @@ def init_vit_weights(model):
                 nn.init.zeros_(m.bias)
 
 
-def build_hybrid(config, dropout: float=0.1):
+def build_hybrid(config, dropout: float=0.2):
 
     conv_layer = CNN_Backbone()
 
@@ -259,6 +348,8 @@ def build_hybrid(config, dropout: float=0.1):
 
     init_vit_weights(hybrid.patch_embedding)
     init_vit_weights(hybrid.encoder)
+    init_vit_weights(hybrid.cross_attention_fuse)
     init_vit_weights(hybrid.projection_layer)
+
 
     return hybrid

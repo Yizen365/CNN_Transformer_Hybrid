@@ -2,22 +2,23 @@ from pathlib import Path
 
 def get_config():
     return {
-        'image_size': 28,
+        'image_size': 224,
         'in_channels': 3,
-        'trans_in_channels': 64,
-        'num_epochs': 80,
-        'class_size': 10,
+        'num_epochs': 160,
+        'cnn_unfreeze_epoch': 10,
+        'class_size': 3,
         'learning_rate': 3e-4,
-        'patch_size': 7,
+        'fine_tune_lr': 1e-5,
+        'patch_size': 16,
         'd_model': 512,
-        'layers': 8,
-        'heads': 32,
+        'layers': 4,
+        'heads': 16,
         'mlp_dim': 2048,
         'batch_size': 32,
-        'data_dir': 'testing',
+        'data_dir': 'lung_image_sets',
         'model_folder': 'weights',
         'model_basename': 'tmodel_',
-        'preload': None,
+        'preload': 'best',
         'experiment_name': 'runs/tmodel'
     }
 
